@@ -1,0 +1,33 @@
+# Training outputs
+outpaint_model_saved/
+outpaint_eval_web/
+lightning_logs/
+
+# Dataset previews
+dataset_preview_outpaint/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large model files
+*.safetensors
+*.bin
+*.ckpt
+*.pt

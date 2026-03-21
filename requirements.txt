@@ -13,3 +13,4 @@ deepspeed
 peft
 lightning
 py360convert
+boto3
