@@ -37,8 +37,8 @@ python train_outpaint_lora.py \
   --max_views=10 \
   --min_fov=75 \
   --max_fov=105 \
-  --min_pitch=-30 \
-  --max_pitch=30 \
+  --min_pitch=-75 \
+  --max_pitch=75 \
   --train_batch_size=1 \
   --adam_weight_decay=1e-2 \
   --dataloader_num_workers=16 \
@@ -53,7 +53,7 @@ python train_outpaint_lora.py \
   --lora_alpha=64 \
   --lora_drop_out=0.05 \
   --gaussian_init_lora \
-  --precision=16-mixed \
+  --precision=bf16-mixed \
   --accumulate_grad_batches=1 \
   --learning_rate="${LR:-2e-5}" \
   --adam_epsilon=1e-6 \
@@ -62,4 +62,4 @@ python train_outpaint_lora.py \
   --eval_every_n_steps="${EVAL_EVERY:-1000}" \
   --eval_num_samples="${EVAL_SAMPLES:-20}" \
   --eval_output_dir="${EVAL_OUT_DIR:-outpaint_eval_web}" \
-  --eval_inference_steps=16
+  --eval_inference_steps=30

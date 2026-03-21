@@ -412,7 +412,7 @@ def _norm_to_uint8_img(tensor: torch.Tensor) -> np.ndarray:
 
 def _mask_to_uint8(mask: torch.Tensor) -> np.ndarray:
     # mask: [1, H, W], 1 means unknown(outpaint area)
-    x = mask.detach().cpu().squeeze(0).numpy()
+    x = mask.detach().cpu().float().squeeze(0).numpy() 
     x = (x > 0.5).astype(np.uint8) * 255
     return x
 

@@ -130,26 +130,53 @@ class DiT360Outpaint(L.LightningModule):
 
         # Base FLUX weights load as float32; passing fp16 activations without autocast causes Half @ Float matmul errors.
         # Match diffusers/Lightning: fp32 tensor inputs + autocast for the transformer forward when target dtype is fp16.
-        use_cuda_amp = self.device.type == "cuda" and dt == torch.float16
+        # use_cuda_amp = self.device.type == "cuda" and dt in (torch.float16, torch.bfloat16)
+        target_dtype = torch.bfloat16 if "bf16" in str(self.hparams.args.precision) else torch.float16
         t_norm = timesteps / 1000
-        if use_cuda_amp:
-            amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
-            hs_in = packed_noisy_model_input.to(torch.float32)
-            t_in = t_norm.to(torch.float32)
-            img_in = latent_image_ids.to(torch.float32)
-            gv_in = guidance_vec.to(torch.float32) if guidance_vec is not None else None
-            pe_in = prompt_embeds.to(torch.float32)
-            ppe_in = pooled_prompt_embeds.to(torch.float32)
-            tid_in = text_ids.to(torch.float32)
-        else:
-            amp_ctx = nullcontext()
-            hs_in = packed_noisy_model_input.to(dt)
-            t_in = t_norm.to(dt)
-            img_in = latent_image_ids
-            gv_in = guidance_vec
-            pe_in = prompt_embeds
-            ppe_in = pooled_prompt_embeds
-            tid_in = text_ids
+        # if use_cuda_amp:
+        #     amp_ctx = torch.autocast(device_type="cuda", dtype=dt)
+        #     hs_in = packed_noisy_model_input.to(torch.float32)
+        #     t_in = t_norm.to(torch.float32)
+        #     img_in = latent_image_ids.to(torch.float32)
+        #     gv_in = guidance_vec.to(torch.float32) if guidance_vec is not None else None
+        #     pe_in = prompt_embeds.to(torch.float32)
+        #     ppe_in = pooled_prompt_embeds.to(torch.float32)
+        #     tid_in = text_ids.to(torch.float32)
+        # else:
+        #     amp_ctx = nullcontext()
+        #     hs_in = packed_noisy_model_input.to(dt)
+        #     t_in = t_norm.to(dt)
+        #     img_in = latent_image_ids
+        #     gv_in = guidance_vec
+        #     pe_in = prompt_embeds.to(dt)
+        #     ppe_in = pooled_prompt_embeds.to(dt)
+        #     tid_in = text_ids.to(dt)
+
+        # with amp_ctx:
+        #     model_pred = self.flux_transformer(
+        #         hidden_states=hs_in,
+        #         timestep=t_in,
+        #         guidance=gv_in,
+        #         pooled_projections=ppe_in,
+        #         encoder_hidden_states=pe_in,
+        #         txt_ids=tid_in,
+        #         img_ids=img_in,
+        #         return_dict=False,
+        #     )[0]
+
+        # 2. 强制将所有输入对其到目标精度 (BFloat16)，匹配 FLUX 的 Base Weights
+        hs_in = packed_noisy_model_input.to(target_dtype)
+        t_in = t_norm.to(target_dtype)
+        img_in = latent_image_ids.to(target_dtype)
+        gv_in = guidance_vec.to(target_dtype) if guidance_vec is not None else None
+        pe_in = prompt_embeds.to(target_dtype)
+        ppe_in = pooled_prompt_embeds.to(target_dtype)
+        tid_in = text_ids.to(target_dtype)
+
+        # 3. 【极其关键】必须加回局部的 autocast！
+        # 这样当 BFloat16 的输入遇到你 __init__ 里设置的 FP32 LoRA 权重时，
+        # autocast 才会介入，把 LoRA 权重也转为 BFloat16，完美完成前向传播。
+        amp_ctx = torch.autocast(device_type="cuda", dtype=target_dtype) if self.device.type == "cuda" else nullcontext()
 
         with amp_ctx:
             model_pred = self.flux_transformer(
@@ -203,6 +230,7 @@ class DiT360Outpaint(L.LightningModule):
         # tensors are expected on current model device
         dt = inference_dtype if inference_dtype is not None else self.dtype
         bsz = condition_pixels.shape[0]
+        amp_ctx = torch.autocast(device_type="cuda", dtype=dt) if self.device.type == "cuda" else nullcontext()
         condition_latents = encode_images(condition_pixels, self.vae).to(dt)
         unknown_masks = F.interpolate(
             unknown_masks.to(dt),
@@ -246,20 +274,21 @@ class DiT360Outpaint(L.LightningModule):
             **timestep_kwargs,
         )
 
-        for t in timesteps:
-            timestep = t.expand(bsz).to(dt)
-            noisy_model_input = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
-            model_pred = self._forward_flux(
-                noisy_model_input=noisy_model_input,
-                timesteps=timestep,
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                text_ids=text_ids,
-                forward_dtype=dt,
-                guidance_scale_override=guidance_scale_override,
-            )
-            latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
-            latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
+        with amp_ctx:
+            for t in timesteps:
+                timestep = t.expand(bsz).to(dt)
+                noisy_model_input = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
+                model_pred = self._forward_flux(
+                    noisy_model_input=noisy_model_input,
+                    timesteps=timestep,
+                    prompt_embeds=prompt_embeds,
+                    pooled_prompt_embeds=pooled_prompt_embeds,
+                    text_ids=text_ids,
+                    forward_dtype=dt,
+                    guidance_scale_override=guidance_scale_override,
+                )
+                latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
 
         return self._decode_latents(latents)
 
@@ -331,7 +360,7 @@ class DiT360Outpaint(L.LightningModule):
 
         per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
         masked_loss = per_pixel_loss * unknown_masks.float()
-        denom = unknown_masks.sum().clamp(min=1.0)
+        denom = unknown_masks.float().sum().clamp(min=1.0)
         loss = masked_loss.sum() / (denom * target.shape[1])
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)

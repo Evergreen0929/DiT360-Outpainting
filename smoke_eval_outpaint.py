@@ -156,6 +156,9 @@ def main():
         perspective_size=a.perspective_size,
     )
 
+    inference_dtype = resolve_smoke_inference_dtype(device, a.inference_dtype)
+    print(f"[smoke] inference_dtype={inference_dtype} (training eval uses pl_module.dtype, typically float16 with 16-mixed)")
+    
     model_args = _model_args_from_cli(a)
     lora_config = LoraConfig(
         r=a.rank,
@@ -166,7 +169,7 @@ def main():
         lora_dropout=a.lora_drop_out,
     )
     model = DiT360Outpaint(model_args, lora_config=lora_config)
-    model = model.to(device)
+    model = model.to(device, dtype=inference_dtype)
     model.on_fit_start()
     model.eval()
 

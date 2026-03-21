@@ -58,7 +58,7 @@ def collate_fn(examples, text_encoding_pipeline):
 
 
 def _norm_to_uint8_img(tensor: torch.Tensor):
-    x = tensor.detach().cpu().clamp(-1.0, 1.0)
+    x = tensor.detach().cpu().float().clamp(-1.0, 1.0) 
     x = (x * 0.5 + 0.5).clamp(0.0, 1.0)
     return (x.permute(1, 2, 0).numpy() * 255.0).astype("uint8")
 
