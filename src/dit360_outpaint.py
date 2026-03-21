@@ -1,4 +1,6 @@
 import copy
+from contextlib import nullcontext
+from typing import Optional
 
 import lightning as L
 import torch
@@ -12,7 +14,7 @@ from transformers import get_cosine_schedule_with_warmup, get_constant_schedule_
 
 from src.lora_init import load_initial_lora_weights
 from src.outpaint_dataset import build_condition_from_target
-from src.pipeline import DiT360Pipeline
+from src.pipeline import DiT360Pipeline, calculate_shift, retrieve_timesteps
 
 
 def encode_images(pixels: torch.Tensor, vae: torch.nn.Module) -> torch.Tensor:
@@ -69,7 +71,17 @@ class DiT360Outpaint(L.LightningModule):
     def on_fit_start(self):
         self.vae = self.vae.to(dtype=torch.float32)
 
-    def _forward_flux(self, noisy_model_input, timesteps, prompt_embeds, pooled_prompt_embeds, text_ids):
+    def _forward_flux(
+        self,
+        noisy_model_input,
+        timesteps,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        text_ids,
+        forward_dtype: Optional[torch.dtype] = None,
+        guidance_scale_override: Optional[float] = None,
+    ):
+        dt = forward_dtype if forward_dtype is not None else self.dtype
         bsz = noisy_model_input.shape[0]
         packed_noisy_model_input = DiT360Pipeline._pack_latents(
             noisy_model_input,
@@ -92,7 +104,7 @@ class DiT360Outpaint(L.LightningModule):
             packed_noisy_model_input = packed_noisy_model_input.reshape(bsz, -1, dim)
 
         latent_image_ids = DiT360Pipeline._prepare_latent_image_ids(
-            bsz, packed_height, packed_width, self.device, self.dtype
+            bsz, packed_height, packed_width, self.device, dt
         )
         if padding_n > 0:
             latent_image_ids = latent_image_ids.reshape(packed_height, packed_width, 3)
@@ -102,25 +114,57 @@ class DiT360Outpaint(L.LightningModule):
             latent_image_ids = latent_image_ids.reshape(-1, 3)
 
         if self.flux_transformer.config.guidance_embeds:
+            g = (
+                guidance_scale_override
+                if guidance_scale_override is not None
+                else self.hparams.args.guidance_scale
+            )
             guidance_vec = torch.full(
                 (bsz,),
-                self.hparams.args.guidance_scale,
+                g,
                 device=self.device,
-                dtype=self.dtype,
+                dtype=dt,
             )
         else:
             guidance_vec = None
 
-        model_pred = self.flux_transformer(
-            hidden_states=packed_noisy_model_input,
-            timestep=timesteps / 1000,
-            guidance=guidance_vec,
-            pooled_projections=pooled_prompt_embeds,
-            encoder_hidden_states=prompt_embeds,
-            txt_ids=text_ids,
-            img_ids=latent_image_ids,
-            return_dict=False,
-        )[0]
+        # Base FLUX weights load as float32; passing fp16 activations without autocast causes Half @ Float matmul errors.
+        # Match diffusers/Lightning: fp32 tensor inputs + autocast for the transformer forward when target dtype is fp16.
+        use_cuda_amp = self.device.type == "cuda" and dt == torch.float16
+        t_norm = timesteps / 1000
+        if use_cuda_amp:
+            amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
+            hs_in = packed_noisy_model_input.to(torch.float32)
+            t_in = t_norm.to(torch.float32)
+            img_in = latent_image_ids.to(torch.float32)
+            gv_in = guidance_vec.to(torch.float32) if guidance_vec is not None else None
+            pe_in = prompt_embeds.to(torch.float32)
+            ppe_in = pooled_prompt_embeds.to(torch.float32)
+            tid_in = text_ids.to(torch.float32)
+        else:
+            amp_ctx = nullcontext()
+            hs_in = packed_noisy_model_input.to(dt)
+            t_in = t_norm.to(dt)
+            img_in = latent_image_ids
+            gv_in = guidance_vec
+            pe_in = prompt_embeds
+            ppe_in = pooled_prompt_embeds
+            tid_in = text_ids
+
+        with amp_ctx:
+            model_pred = self.flux_transformer(
+                hidden_states=hs_in,
+                timestep=t_in,
+                guidance=gv_in,
+                pooled_projections=ppe_in,
+                encoder_hidden_states=pe_in,
+                txt_ids=tid_in,
+                img_ids=img_in,
+                return_dict=False,
+            )[0]
+
+        if model_pred.dtype != dt:
+            model_pred = model_pred.to(dt)
 
         if padding_n > 0:
             model_pred = model_pred.reshape(bsz, packed_height, packed_width + 2 * padding_n, -1)
@@ -136,7 +180,10 @@ class DiT360Outpaint(L.LightningModule):
         return model_pred
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        # VAE is kept in float32 (on_fit_start); latents from sampling may be fp16 under mixed precision.
+        vae_dtype = next(self.vae.parameters()).dtype
         latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        latents = latents.to(dtype=vae_dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
         return image.clamp(-1.0, 1.0)
 
@@ -150,12 +197,15 @@ class DiT360Outpaint(L.LightningModule):
         text_ids: torch.Tensor,
         num_inference_steps: int = 16,
         seed: int = 0,
+        inference_dtype: Optional[torch.dtype] = None,
+        guidance_scale_override: Optional[float] = None,
     ) -> torch.Tensor:
         # tensors are expected on current model device
+        dt = inference_dtype if inference_dtype is not None else self.dtype
         bsz = condition_pixels.shape[0]
-        condition_latents = encode_images(condition_pixels, self.vae).to(self.dtype)
+        condition_latents = encode_images(condition_pixels, self.vae).to(dt)
         unknown_masks = F.interpolate(
-            unknown_masks.to(self.dtype),
+            unknown_masks.to(dt),
             size=(condition_latents.shape[2], condition_latents.shape[3]),
             mode="nearest",
         )
@@ -164,16 +214,40 @@ class DiT360Outpaint(L.LightningModule):
         latents = torch.randn(
             condition_latents.shape,
             device=self.device,
-            dtype=self.dtype,
+            dtype=dt,
             generator=generator,
         )
         latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
 
         scheduler = copy.deepcopy(self.noise_scheduler)
-        scheduler.set_timesteps(num_inference_steps, device=self.device)
+        _, _, h_lat, w_lat = condition_latents.shape
+        packed = DiT360Pipeline._pack_latents(
+            condition_latents,
+            batch_size=bsz,
+            num_channels_latents=condition_latents.shape[1],
+            height=h_lat,
+            width=w_lat,
+        )
+        image_seq_len = packed.shape[1]
+        sched_cfg = scheduler.config
+        timestep_kwargs = {}
+        if getattr(sched_cfg, "use_dynamic_shifting", False):
+            timestep_kwargs["mu"] = calculate_shift(
+                image_seq_len,
+                getattr(sched_cfg, "base_image_seq_len", 256),
+                getattr(sched_cfg, "max_image_seq_len", 4096),
+                getattr(sched_cfg, "base_shift", 0.5),
+                getattr(sched_cfg, "max_shift", 1.15),
+            )
+        timesteps, _ = retrieve_timesteps(
+            scheduler,
+            num_inference_steps,
+            self.device,
+            **timestep_kwargs,
+        )
 
-        for t in scheduler.timesteps:
-            timestep = t.expand(bsz).to(self.dtype)
+        for t in timesteps:
+            timestep = t.expand(bsz).to(dt)
             noisy_model_input = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
             model_pred = self._forward_flux(
                 noisy_model_input=noisy_model_input,
@@ -181,6 +255,8 @@ class DiT360Outpaint(L.LightningModule):
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 text_ids=text_ids,
+                forward_dtype=dt,
+                guidance_scale_override=guidance_scale_override,
             )
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents

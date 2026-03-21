@@ -323,7 +323,9 @@ class RandomPerspOutpaintDataset(Dataset):
         return f"{self.pano_root}/{pano_id}.{self.image_ext}"
 
     def _sample_view_params(self) -> Tuple[torch.Tensor, int]:
-        n_views = random.randint(self.min_views, self.max_views)
+        candidates = list(range(self.min_views, self.max_views + 1))
+        weights = [self.max_views + 1 - k for k in candidates]
+        n_views = random.choices(candidates, weights=weights, k=1)[0]
         params = torch.zeros((self.max_views, 3), dtype=torch.float32)
         for i in range(n_views):
             yaw = random.uniform(-180.0, 180.0)

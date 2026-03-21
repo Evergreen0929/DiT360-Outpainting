@@ -7,16 +7,35 @@ from typing import Dict, List
 import lightning as L
 import torch
 from PIL import Image
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import ModelCheckpoint, Callback, TQDMProgressBar
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from peft import LoraConfig
 from pytorch_lightning import seed_everything
 from torch.utils.data import WeightedRandomSampler
 
 from src.dit360_outpaint import DiT360Outpaint
-from src.outpaint_dataset import RandomPerspOutpaintDataset, build_condition_from_target
+from src.outpaint_dataset import RandomPerspOutpaintDataset
+from src.outpaint_eval_utils import run_one_outpaint_eval
 from src.pipeline import DiT360Pipeline
 
+class VerboseTQDMProgressBar(TQDMProgressBar):
+
+    def __init__(self, decimals: int = 8, **kwargs):
+        super().__init__(**kwargs)
+        self._decimals = decimals
+
+    def get_metrics(self, trainer, pl_module):
+        metrics = super().get_metrics(trainer, pl_module)
+        fmt = f"{{:.{self._decimals}f}}"
+        out = {}
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                v = v.detach().item()
+            if isinstance(v, float):
+                out[k] = fmt.format(v)
+            else:
+                out[k] = v
+        return out
 
 def collate_fn(examples, text_encoding_pipeline):
     examples = list(examples)
@@ -95,7 +114,10 @@ class PeriodicOutpaintEvalCallback(Callback):
         )
 
         total = len(self.eval_dataset)
-        self.eval_indices = list(range(min(args.eval_num_samples, total)))
+        k = min(args.eval_num_samples, total)
+        rng = random.Random(args.eval_seed)
+        self.eval_indices = rng.sample(range(total), k=k)
+        print(f"[Eval] Subset: {k}/{total} dataset indices (random.sample, eval_seed={args.eval_seed})")
 
     @torch.no_grad()
     def _run_eval(self, trainer, pl_module, step: int):
@@ -107,34 +129,19 @@ class PeriodicOutpaintEvalCallback(Callback):
         eval_rng_state = random.getstate()
         random.seed(self.args.eval_seed)
 
+        inference_dtype = pl_module.dtype
         rows = []
         for i, idx in enumerate(self.eval_indices):
             sample = self.eval_dataset[idx]
-            target_pixels = sample.target_pixel_values.to(device=device, dtype=pl_module.dtype)
-            view_params = sample.view_params.to(device=device)
-            condition, unknown = build_condition_from_target(
-                target_pixel_values=target_pixels,
-                view_params=view_params,
-                num_views=sample.num_views,
+            condition, generated, target_cpu = run_one_outpaint_eval(
+                pl_module,
+                sample,
+                self.text_encoding_pipeline,
                 perspective_size=self.args.perspective_size,
-            )
-
-            prompt_embeds, pooled_prompt_embeds, text_ids = self.text_encoding_pipeline.encode_prompt(
-                [sample.captions], prompt_2=None
-            )
-            prompt_embeds = prompt_embeds.to(device=device, dtype=pl_module.dtype)
-            pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=pl_module.dtype)
-            text_ids = text_ids.to(device=device, dtype=pl_module.dtype)
-
-            generated = pl_module.sample_outpaint(
-                condition_pixels=condition.unsqueeze(0).to(device=device, dtype=pl_module.dtype),
-                unknown_masks=unknown.unsqueeze(0).to(device=device, dtype=pl_module.dtype),
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                text_ids=text_ids,
                 num_inference_steps=self.args.eval_inference_steps,
-                seed=self.args.eval_seed + i,
-            )[0]
+                inference_seed=self.args.eval_seed + i,
+                inference_dtype=inference_dtype,
+            )
 
             sid = self.eval_dataset.ids[idx]
             in_name = f"{i:03d}_{sid}_input.png"
@@ -143,7 +150,7 @@ class PeriodicOutpaintEvalCallback(Callback):
 
             Image.fromarray(_norm_to_uint8_img(condition.cpu())).save(os.path.join(step_dir, in_name))
             Image.fromarray(_norm_to_uint8_img(generated.cpu())).save(os.path.join(step_dir, gen_name))
-            Image.fromarray(_norm_to_uint8_img(sample.target_pixel_values)).save(os.path.join(step_dir, tgt_name))
+            Image.fromarray(_norm_to_uint8_img(target_cpu)).save(os.path.join(step_dir, tgt_name))
 
             rows.append(
                 {
@@ -243,7 +250,12 @@ def parse_args():
     parser.add_argument("--eval_num_samples", type=int, default=20)
     parser.add_argument("--eval_output_dir", type=str, default="outpaint_eval_web")
     parser.add_argument("--eval_inference_steps", type=int, default=30)
-    parser.add_argument("--eval_seed", type=int, default=1234)
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=1234,
+        help="RNG seed for eval: which test IDs are chosen (random.sample) and view randomness during eval.",
+    )
 
     return parser.parse_args()
 
@@ -319,18 +331,22 @@ def main():
     )
     eval_callback = PeriodicOutpaintEvalCallback(args=args, text_encoding_pipeline=text_encoding_pipeline)
 
+    csv_logger = CSVLogger(save_dir=args.save_dir, name="csv_logs")
+    tb_logger = TensorBoardLogger(save_dir=args.save_dir, name="tb_logs")
+
     use_max_steps = args.max_steps > 0
     trainer = L.Trainer(
         devices=args.devices,
         accelerator="gpu",
-        callbacks=[epoch_ckpt, step_ckpt, eval_callback],
+        callbacks=[VerboseTQDMProgressBar(decimals=8), epoch_ckpt, step_ckpt, eval_callback],
+        logger=[tb_logger, csv_logger],
         default_root_dir=args.save_dir,
         max_steps=args.max_steps if use_max_steps else -1,
         max_epochs=args.max_epochs if not use_max_steps else -1,
         precision=args.precision,
         strategy="deepspeed_stage_2",
         accumulate_grad_batches=args.accumulate_grad_batches,
-        log_every_n_steps=100,
+        log_every_n_steps=10,
     )
 
     model = DiT360Outpaint(args, lora_config=lora_config)
