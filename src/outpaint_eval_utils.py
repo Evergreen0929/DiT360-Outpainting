@@ -94,10 +94,10 @@ def run_one_outpaint_eval(
         generated: [3,H,W] on device — after optional RGB composite (known region from condition)
         target_pixels: [3,H,W] CPU float (dataset tensor, for saving)
 
-    The mask passed to ``sample_outpaint`` is dilated inside the Lightning module (if
-    ``outpaint_mask_dilate_px`` > 0); ``composite_generated_with_condition`` uses the
-    original undilated ``unknown`` from ``build_condition_from_target`` so pasted known
-    pixels align with the true FOV boundary.
+    The mask passed to ``sample_outpaint`` is optionally dilated in the Lightning module (if
+    ``outpaint_mask_dilate_px`` > 0), then downsampled with nearest neighbors to latent size.
+    ``composite_generated_with_condition`` uses the original undilated ``unknown`` from
+    ``build_condition_from_target`` so pasted known pixels align with the true FOV boundary.
     """
     device = pl_module.device
     target_pixels = sample.target_pixel_values.to(device=device, dtype=inference_dtype)

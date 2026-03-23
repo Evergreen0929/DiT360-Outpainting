@@ -239,8 +239,7 @@ class DiT360Outpaint(L.LightningModule):
         unknown_masks = F.interpolate(
             um,
             size=(condition_latents.shape[2], condition_latents.shape[3]),
-            mode="bilinear",
-            align_corners=False,
+            mode="nearest",
         )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -326,8 +325,7 @@ class DiT360Outpaint(L.LightningModule):
         unknown_masks = F.interpolate(
             um,
             size=(target_latents.shape[2], target_latents.shape[3]),
-            mode="bilinear",
-            align_corners=False,
+            mode="nearest",
         )
 
         bsz = target_latents.shape[0]

@@ -206,7 +206,7 @@ def parse_args():
         "--outpaint_mask_dilate_px",
         type=int,
         default=4,
-        help="Dilate inpaint (unknown) mask in pixel space before latent resize, train + sample_outpaint; 0=off. "
+        help="Dilate unknown mask in pixel space (hard edges) before nearest resize to latent, train + sample_outpaint; 0=off. "
         "Eval RGB composite still uses the undilated mask.",
     )
     parser.add_argument("--min_views", type=int, default=1)

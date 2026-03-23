@@ -365,7 +365,8 @@ def build_condition_from_target(
     pano_01 = (target_pixel_values.float().clamp(-1.0, 1.0) * 0.5 + 0.5).unsqueeze(0)
     _, _, pano_h, pano_w = pano_01.shape
 
-    canvas = torch.zeros((1, 3, pano_h, pano_w), dtype=torch.float32, device=device)
+    # Unknown (unfilled) region: mid-gray in [0,1] -> 0 in [-1,1], matching dataset Normalize(0.5,0.5).
+    canvas = torch.full((1, 3, pano_h, pano_w), 0.5, dtype=torch.float32, device=device)
     known_mask = torch.zeros((1, 1, pano_h, pano_w), dtype=torch.float32, device=device)
 
     for i in range(int(num_views)):
