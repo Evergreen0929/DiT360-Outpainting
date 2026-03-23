@@ -13,7 +13,7 @@ from diffusers.training_utils import (
 from transformers import get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
 
 from src.lora_init import load_initial_lora_weights
-from src.outpaint_dataset import build_condition_from_target
+from src.outpaint_dataset import build_condition_from_target, dilate_unknown_mask
 from src.pipeline import DiT360Pipeline, calculate_shift, retrieve_timesteps
 
 
@@ -63,6 +63,7 @@ class DiT360Outpaint(L.LightningModule):
 
         self.flux_transformer.train()
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self._mask_dilate_px = int(getattr(args, "outpaint_mask_dilate_px", 0) or 0)
         self.weighting_scheme = args.weighting_scheme
         self.logit_mean = args.logit_mean
         self.logit_std = args.logit_std
@@ -232,10 +233,13 @@ class DiT360Outpaint(L.LightningModule):
         bsz = condition_pixels.shape[0]
         amp_ctx = torch.autocast(device_type="cuda", dtype=dt) if self.device.type == "cuda" else nullcontext()
         condition_latents = encode_images(condition_pixels, self.vae).to(dt)
+        um = unknown_masks.to(dt)
+        if self._mask_dilate_px > 0:
+            um = dilate_unknown_mask(um, radius_px=self._mask_dilate_px)
         unknown_masks = F.interpolate(
-            unknown_masks.to(dt),
+            um,
             size=(condition_latents.shape[2], condition_latents.shape[3]),
-            mode="bilinear", 
+            mode="bilinear",
             align_corners=False,
         )
 
@@ -316,8 +320,11 @@ class DiT360Outpaint(L.LightningModule):
 
         target_latents = encode_images(target_pixels, self.vae).to(self.dtype)
         condition_latents = encode_images(condition_pixels, self.vae).to(self.dtype)
+        um = unknown_masks
+        if self._mask_dilate_px > 0:
+            um = dilate_unknown_mask(um, radius_px=self._mask_dilate_px)
         unknown_masks = F.interpolate(
-            unknown_masks,
+            um,
             size=(target_latents.shape[2], target_latents.shape[3]),
             mode="bilinear",
             align_corners=False,

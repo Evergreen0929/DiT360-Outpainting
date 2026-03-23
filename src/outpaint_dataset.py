@@ -402,6 +402,23 @@ def build_condition_from_target(
     return condition, unknown_mask
 
 
+def dilate_unknown_mask(mask_n1hw: torch.Tensor, *, radius_px: int) -> torch.Tensor:
+    """
+    Morphological dilation of the inpaint region (unknown=1) in pixel space before latent resize.
+    mask_n1hw: [N, 1, H, W], values in [0, 1].
+    radius_px: half-width of square structuring element, e.g. 3 -> 7×7 max-pool (~3px outward).
+    """
+    if radius_px <= 0:
+        return mask_n1hw
+    if mask_n1hw.dim() != 4 or mask_n1hw.size(1) != 1:
+        raise ValueError(f"dilate_unknown_mask expects [N,1,H,W], got {tuple(mask_n1hw.shape)}")
+    x = mask_n1hw.float()
+    k = 2 * int(radius_px) + 1
+    pad = int(radius_px)
+    y = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+    return y.clamp(0.0, 1.0).to(dtype=mask_n1hw.dtype)
+
+
 def _norm_to_uint8_img(tensor: torch.Tensor) -> np.ndarray:
     # tensor: [3, H, W], normalized to [-1, 1]
     x = tensor.detach().cpu().clamp(-1.0, 1.0)

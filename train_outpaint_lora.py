@@ -141,6 +141,8 @@ class PeriodicOutpaintEvalCallback(Callback):
                 num_inference_steps=self.args.eval_inference_steps,
                 inference_seed=self.args.eval_seed + i,
                 inference_dtype=inference_dtype,
+                eval_feather_sigma=self.args.eval_feather_sigma,
+                eval_feather_kernel=self.args.eval_feather_kernel,
             )
 
             sid = self.eval_dataset.ids[idx]
@@ -200,6 +202,13 @@ def parse_args():
     parser.add_argument("--pano_height", type=int, default=512)
     parser.add_argument("--pano_width", type=int, default=1024)
     parser.add_argument("--perspective_size", type=int, default=512)
+    parser.add_argument(
+        "--outpaint_mask_dilate_px",
+        type=int,
+        default=4,
+        help="Dilate inpaint (unknown) mask in pixel space before latent resize, train + sample_outpaint; 0=off. "
+        "Eval RGB composite still uses the undilated mask.",
+    )
     parser.add_argument("--min_views", type=int, default=1)
     parser.add_argument("--max_views", type=int, default=10)
     parser.add_argument("--min_fov", type=float, default=75.0)
@@ -255,6 +264,18 @@ def parse_args():
         type=int,
         default=1234,
         help="RNG seed for eval: which test IDs are chosen (random.sample) and view randomness during eval.",
+    )
+    parser.add_argument(
+        "--eval_feather_sigma",
+        type=float,
+        default=8.0,
+        help="Eval only: Gaussian sigma (pixels) when pasting known region from condition onto generated; 0 = hard mask.",
+    )
+    parser.add_argument(
+        "--eval_feather_kernel",
+        type=int,
+        default=None,
+        help="Eval only: odd blur kernel size for feather; default derived from sigma.",
     )
 
     return parser.parse_args()

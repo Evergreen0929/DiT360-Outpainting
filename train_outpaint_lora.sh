@@ -15,6 +15,8 @@ export TEST_IDS="/mnt/localssd/code/DiT360/data/panomtdu_test.json"
 # export EVAL_EVERY=1000
 # export EVAL_SAMPLES=8
 # export EVAL_OUT_DIR="outpaint_eval_web"
+# Inpaint mask dilation in full pano pixels before latent resize (0 = off). Default in Python is 4 if unset.
+# export OUTPAINT_MASK_DILATE_PX=4
 # Optional subset mix ratio example:
 export SUBSET_RATIOS="Sun360:2,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1"
 
@@ -59,7 +61,8 @@ python train_outpaint_lora.py \
   --adam_epsilon=1e-6 \
   --padding_n=1 \
   --save_every_n_steps="${SAVE_STEPS:-1000}" \
-  --eval_every_n_steps="${EVAL_EVERY:-1000}" \
+  --eval_every_n_steps="${EVAL_EVERY:-500}" \
   --eval_num_samples="${EVAL_SAMPLES:-20}" \
   --eval_output_dir="${EVAL_OUT_DIR:-outpaint_eval_web}" \
-  --eval_inference_steps=30
+  --eval_inference_steps=30 \
+  --outpaint_mask_dilate_px="${OUTPAINT_MASK_DILATE_PX:-16}"

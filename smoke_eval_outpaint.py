@@ -73,6 +73,7 @@ def _model_args_from_cli(a: argparse.Namespace) -> Namespace:
         padding_n=a.padding_n,
         guidance_scale=a.guidance_scale,
         perspective_size=a.perspective_size,
+        outpaint_mask_dilate_px=a.outpaint_mask_dilate_px,
         weighting_scheme="none",
         logit_mean=0.0,
         logit_std=1.0,
@@ -101,6 +102,12 @@ def parse_args():
     p.add_argument("--pano_height", type=int, default=512)
     p.add_argument("--pano_width", type=int, default=1024)
     p.add_argument("--perspective_size", type=int, default=512)
+    p.add_argument(
+        "--outpaint_mask_dilate_px",
+        type=int,
+        default=4,
+        help="Match training: dilate unknown mask before model; eval composite uses undilated mask.",
+    )
     p.add_argument("--min_views", type=int, default=1)
     p.add_argument("--max_views", type=int, default=10)
     p.add_argument("--min_fov", type=float, default=75.0)
@@ -127,6 +134,13 @@ def parse_args():
         choices=["auto", "fp16", "fp32"],
         help="Must match training eval: use 'auto' (fp16 on CUDA, same as 16-mixed) or match --precision.",
     )
+    p.add_argument(
+        "--eval_feather_sigma",
+        type=float,
+        default=8.0,
+        help="RGB composite after sampling: Gaussian sigma (pixels); 0 = hard paste known from condition.",
+    )
+    p.add_argument("--eval_feather_kernel", type=int, default=None, help="Odd blur kernel; default from sigma.")
     return p.parse_args()
 
 
@@ -203,6 +217,8 @@ def main():
                 num_inference_steps=a.num_inference_steps,
                 inference_seed=a.eval_seed + i,
                 inference_dtype=inference_dtype,
+                eval_feather_sigma=a.eval_feather_sigma,
+                eval_feather_kernel=a.eval_feather_kernel,
             )
 
         sid = ds.ids[idx]
