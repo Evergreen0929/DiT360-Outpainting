@@ -133,7 +133,7 @@ class PeriodicOutpaintEvalCallback(Callback):
         rows = []
         for i, idx in enumerate(self.eval_indices):
             sample = self.eval_dataset[idx]
-            condition, generated, target_cpu = run_one_outpaint_eval(
+            condition, _generated_raw, generated, target_cpu = run_one_outpaint_eval(
                 pl_module,
                 sample,
                 self.text_encoding_pipeline,
@@ -143,6 +143,7 @@ class PeriodicOutpaintEvalCallback(Callback):
                 inference_dtype=inference_dtype,
                 eval_feather_sigma=self.args.eval_feather_sigma,
                 eval_feather_kernel=self.args.eval_feather_kernel,
+                inference_valid_mask_blur_kernel_px=self.args.eval_valid_mask_blur_kernel_px,
             )
 
             sid = self.eval_dataset.ids[idx]
@@ -268,7 +269,7 @@ def parse_args():
     parser.add_argument(
         "--eval_feather_sigma",
         type=float,
-        default=8.0,
+        default=32.0,
         help="Eval only: Gaussian sigma (pixels) when pasting known region from condition onto generated; 0 = hard mask.",
     )
     parser.add_argument(
@@ -276,6 +277,13 @@ def parse_args():
         type=int,
         default=None,
         help="Eval only: odd blur kernel size for feather; default derived from sigma.",
+    )
+    parser.add_argument(
+        "--eval_valid_mask_blur_kernel_px",
+        type=int,
+        default=32,
+        help="Eval/sample_outpaint only: Gaussian blur valid (known) mask in pixel space before latent resize; "
+        "<3 disables. Training loss path unchanged.",
     )
 
     return parser.parse_args()

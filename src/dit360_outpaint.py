@@ -14,7 +14,24 @@ from transformers import get_cosine_schedule_with_warmup, get_constant_schedule_
 
 from src.lora_init import load_initial_lora_weights
 from src.outpaint_dataset import build_condition_from_target, dilate_unknown_mask
+from src.outpaint_eval_utils import _gaussian_blur2d_1ch
 from src.pipeline import DiT360Pipeline, calculate_shift, retrieve_timesteps
+
+
+def _soften_unknown_mask_by_blurring_valid(um: torch.Tensor, kernel_px: int) -> torch.Tensor:
+    """
+    Pixel-space: Gaussian-blur the valid (known) mask ``valid = 1 - unknown``, then return new
+    unknown = 1 - blurred(valid). Softens the inpaint boundary for inference only; odd kernel if
+    ``kernel_px`` is even.
+    um: [B, 1, H, W] unknown in [0, 1].
+    """
+    if kernel_px < 3:
+        return um
+    k = kernel_px if kernel_px % 2 == 1 else kernel_px + 1
+    sigma = float(k - 1) / 6.0
+    valid = (1.0 - um).clamp(0.0, 1.0)
+    blurred_valid = _gaussian_blur2d_1ch(valid, k, sigma).clamp(0.0, 1.0)
+    return (1.0 - blurred_valid).clamp(0.0, 1.0)
 
 
 def encode_images(pixels: torch.Tensor, vae: torch.nn.Module) -> torch.Tensor:
@@ -227,6 +244,7 @@ class DiT360Outpaint(L.LightningModule):
         seed: int = 0,
         inference_dtype: Optional[torch.dtype] = None,
         guidance_scale_override: Optional[float] = None,
+        valid_mask_blur_kernel_px: int = 0,
     ) -> torch.Tensor:
         # tensors are expected on current model device
         dt = inference_dtype if inference_dtype is not None else self.dtype
@@ -236,6 +254,8 @@ class DiT360Outpaint(L.LightningModule):
         um = unknown_masks.to(dt)
         if self._mask_dilate_px > 0:
             um = dilate_unknown_mask(um, radius_px=self._mask_dilate_px)
+        if valid_mask_blur_kernel_px >= 3:
+            um = _soften_unknown_mask_by_blurring_valid(um, valid_mask_blur_kernel_px)
         unknown_masks = F.interpolate(
             um,
             size=(condition_latents.shape[2], condition_latents.shape[3]),

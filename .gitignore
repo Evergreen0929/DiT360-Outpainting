@@ -1,6 +1,7 @@
 # Training outputs
 outpaint_model_saved/
 outpaint_eval_web/
+outpaint_eval_smoke
 lightning_logs/
 
 # Dataset previews

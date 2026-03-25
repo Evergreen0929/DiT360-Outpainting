@@ -17,6 +17,10 @@ export TEST_IDS="/mnt/localssd/code/DiT360/data/panomtdu_test.json"
 # export EVAL_OUT_DIR="outpaint_eval_web"
 # Inpaint mask dilation in full pano pixels before latent resize (0 = off). Default in Python is 4 if unset.
 # export OUTPAINT_MASK_DILATE_PX=4
+# RGB paste-back feather after eval sampling (pixels sigma); default 32 matches train_outpaint_lora.py.
+# export EVAL_FEATHER_SIGMA=32
+# Blur valid mask in pixel space before latent sampling (sample_outpaint only); even sizes use k+1.
+# export EVAL_VALID_MASK_BLUR_KERNEL_PX=32
 # Optional subset mix ratio example:
 export SUBSET_RATIOS="Sun360:2,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1"
 
@@ -65,4 +69,6 @@ python train_outpaint_lora.py \
   --eval_num_samples="${EVAL_SAMPLES:-20}" \
   --eval_output_dir="${EVAL_OUT_DIR:-outpaint_eval_web}" \
   --eval_inference_steps=30 \
+  --eval_feather_sigma="${EVAL_FEATHER_SIGMA:-32}" \
+  --eval_valid_mask_blur_kernel_px="${EVAL_VALID_MASK_BLUR_KERNEL_PX:-32}" \
   --outpaint_mask_dilate_px="${OUTPAINT_MASK_DILATE_PX:-16}"
