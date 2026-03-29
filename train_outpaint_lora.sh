@@ -2,6 +2,16 @@
 
 set -euo pipefail
 
+# Freeze IAM role credentials into env vars so DataLoader worker subprocesses
+# (forked by PyTorch) can authenticate to S3 without hitting the metadata service.
+eval $(python3 -c "
+import boto3
+c = boto3.Session().get_credentials().get_frozen_credentials()
+print(f'export AWS_ACCESS_KEY_ID={c.access_key}')
+print(f'export AWS_SECRET_ACCESS_KEY={c.secret_key}')
+if c.token: print(f'export AWS_SESSION_TOKEN={c.token}')
+")
+
 # Base model: set USE_FILL_MODEL=1 to use FLUX Fill (inpaint) with 384-channel concat input.
 export USE_FILL_MODEL=1
 export FLUX="black-forest-labs/FLUX.1-Fill-dev"
