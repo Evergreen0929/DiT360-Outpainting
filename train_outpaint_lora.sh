@@ -2,7 +2,10 @@
 
 set -euo pipefail
 
-export FLUX="black-forest-labs/FLUX.1-dev"
+# Base model: set USE_FILL_MODEL=1 to use FLUX Fill (inpaint) with 384-channel concat input.
+export USE_FILL_MODEL=1
+export FLUX="black-forest-labs/FLUX.1-Fill-dev"
+# export FLUX="black-forest-labs/FLUX.1-dev"
 export INIT_LORA="Insta360-Research/DiT360-Panorama-Image-Generation"
 
 # Example:
@@ -48,7 +51,7 @@ python train_outpaint_lora.py \
   --train_batch_size=1 \
   --adam_weight_decay=1e-2 \
   --dataloader_num_workers=16 \
-  --subset_sampling_ratios="${SUBSET_RATIOS:-Sun360:2,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1}" \
+  --subset_sampling_ratios="${SUBSET_RATIOS:-Sun360:4,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1}" \
   --save_dir="$SAVE_DIR" \
   --devices="$CUDA_DEVICE" \
   --max_steps="${MAX_STEPS:-10000}" \
@@ -71,4 +74,5 @@ python train_outpaint_lora.py \
   --eval_inference_steps=30 \
   --eval_feather_sigma="${EVAL_FEATHER_SIGMA:-32}" \
   --eval_valid_mask_blur_kernel_px="${EVAL_VALID_MASK_BLUR_KERNEL_PX:-32}" \
-  --outpaint_mask_dilate_px="${OUTPAINT_MASK_DILATE_PX:-16}"
+  --outpaint_mask_dilate_px="${OUTPAINT_MASK_DILATE_PX:-4}" \
+  ${USE_FILL_MODEL:+--use_fill_model}

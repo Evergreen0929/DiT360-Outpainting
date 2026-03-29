@@ -307,11 +307,15 @@ class RandomPerspOutpaintDataset(Dataset):
         if uri.startswith("s3://"):
             try:
                 import boto3
+                from botocore.config import Config as BotoConfig
             except ImportError as exc:
                 raise ImportError("boto3 is required for s3 training data access") from exc
 
             if self._s3_client is None:
-                self._s3_client = boto3.client("s3")
+                self._s3_client = boto3.client(
+                    "s3",
+                    config=BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"}),
+                )
             bucket, key = _parse_s3_uri(uri)
             obj = self._s3_client.get_object(Bucket=bucket, Key=key)
             binary = obj["Body"].read()

@@ -246,7 +246,7 @@ def parse_args():
     p.add_argument("--min_pitch", type=float, default=-75.0)
     p.add_argument("--max_pitch", type=float, default=75.0)
     p.add_argument("--padding_n", type=int, default=1)
-    p.add_argument("--guidance_scale", type=float, default=1.0)
+    p.add_argument("--guidance_scale", type=float, default=3.0)
     p.add_argument(
         "--precision",
         type=str,

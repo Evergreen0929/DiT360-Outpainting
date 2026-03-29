@@ -58,6 +58,8 @@ class DiT360Outpaint(L.LightningModule):
         self.save_hyperparameters()
         args = self.hparams.args
 
+        self._use_fill_model = getattr(args, "use_fill_model", False)
+
         self.vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
         self.flux_transformer = FluxTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="transformer"
@@ -66,6 +68,17 @@ class DiT360Outpaint(L.LightningModule):
             args.pretrained_model_name_or_path, subfolder="scheduler"
         )
         self.noise_scheduler_copy = copy.deepcopy(self.noise_scheduler)
+
+        if self._use_fill_model:
+            expected_in_ch = 384
+            actual_in_ch = self.flux_transformer.config.in_channels
+            if actual_in_ch != expected_in_ch:
+                raise ValueError(
+                    f"--use_fill_model expects transformer in_channels={expected_in_ch} "
+                    f"(FLUX Fill), but loaded model has in_channels={actual_in_ch}. "
+                    f"Use black-forest-labs/FLUX.1-Fill-dev as pretrained_model_name_or_path."
+                )
+            print(f"[FillModel] Using FLUX Fill model with in_channels={actual_in_ch}")
 
         self.vae.requires_grad_(False)
         self.flux_transformer.requires_grad_(False)
@@ -89,6 +102,51 @@ class DiT360Outpaint(L.LightningModule):
     def on_fit_start(self):
         self.vae = self.vae.to(dtype=torch.float32)
 
+    def _prepare_fill_condition(
+        self,
+        condition_pixels: torch.Tensor,
+        unknown_masks_pixel: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Prepare FLUX Fill-style packed condition tensor.
+
+        Matches ``FluxFillPipeline.prepare_mask_latents`` exactly:
+        1. masked_image = condition * (1 - mask)  →  VAE encode  →  pack  →  [B, seq, 64]
+        2. mask [B, 1, H_px, W_px] →  reshape to [B, vae_sf², H_lat, W_lat]  →  pack  →  [B, seq, 256]
+        3. concat  →  [B, seq, 320]
+
+        Args:
+            condition_pixels: [B, 3, H_px, W_px] in [-1, 1], unknown regions may be any value.
+            unknown_masks_pixel: [B, 1, H_px, W_px] in {0, 1}, 1 = inpaint/unknown.
+        Returns:
+            Packed fill condition [B, seq, 320] (not yet padded for wraparound).
+        """
+        # 1. Masked image: zero-out unknown regions (matches FLUX Fill: image * (1 - mask))
+        masked_image = condition_pixels * (1.0 - unknown_masks_pixel)
+
+        # 2. VAE encode masked image
+        masked_image_latents = encode_images(masked_image, self.vae)  # [B, C_vae, H_lat, W_lat]
+        bsz, c_vae, h_lat, w_lat = masked_image_latents.shape
+
+        # 3. Pack masked_image_latents → [B, seq, c_vae*4]
+        packed_mi = DiT360Pipeline._pack_latents(
+            masked_image_latents, bsz, c_vae, h_lat, w_lat,
+        )  # [B, seq, 64]
+
+        # 4. Prepare mask in FLUX Fill format:
+        #    pixel mask → [B, vae_sf², H_lat, W_lat] → pack → [B, seq, vae_sf²*4]
+        sf = self.vae_scale_factor  # 8
+        mask = unknown_masks_pixel[:, 0, :, :]  # [B, H_px, W_px]
+        mask = mask.view(bsz, h_lat, sf, w_lat, sf)
+        mask = mask.permute(0, 2, 4, 1, 3)  # [B, sf, sf, H_lat, W_lat]
+        mask = mask.reshape(bsz, sf * sf, h_lat, w_lat)  # [B, 64, H_lat, W_lat]
+        packed_mask = DiT360Pipeline._pack_latents(
+            mask, bsz, sf * sf, h_lat, w_lat,
+        )  # [B, seq, 256]
+
+        # 5. Concat → [B, seq, 320]
+        return torch.cat([packed_mi, packed_mask], dim=-1)
+
     def _forward_flux(
         self,
         noisy_model_input,
@@ -98,7 +156,15 @@ class DiT360Outpaint(L.LightningModule):
         text_ids,
         forward_dtype: Optional[torch.dtype] = None,
         guidance_scale_override: Optional[float] = None,
+        fill_condition_packed: Optional[torch.Tensor] = None,
     ):
+        """
+        Args:
+            noisy_model_input: [B, C_vae, H_lat, W_lat] noisy latents (C_vae=16 for FLUX).
+            fill_condition_packed: (Fill mode only) [B, seq, 320] from ``_prepare_fill_condition``,
+                already packed but **not** padded for wraparound. Will be padded and concatenated
+                with the packed noisy latents to form [B, padded_seq, 384].
+        """
         dt = forward_dtype if forward_dtype is not None else self.dtype
         bsz = noisy_model_input.shape[0]
         packed_noisy_model_input = DiT360Pipeline._pack_latents(
@@ -120,6 +186,21 @@ class DiT360Outpaint(L.LightningModule):
             last_col = packed_noisy_model_input[:, :, -padding_n:, :]
             packed_noisy_model_input = torch.cat([last_col, packed_noisy_model_input, first_col], dim=2)
             packed_noisy_model_input = packed_noisy_model_input.reshape(bsz, -1, dim)
+
+            # Apply identical wraparound padding to fill_condition_packed
+            if fill_condition_packed is not None:
+                fill_dim = fill_condition_packed.shape[-1]
+                fill_condition_packed = fill_condition_packed.reshape(bsz, packed_height, packed_width, fill_dim)
+                fc_first = fill_condition_packed[:, :, 0:padding_n, :]
+                fc_last = fill_condition_packed[:, :, -padding_n:, :]
+                fill_condition_packed = torch.cat([fc_last, fill_condition_packed, fc_first], dim=2)
+                fill_condition_packed = fill_condition_packed.reshape(bsz, -1, fill_dim)
+
+        # For Fill mode: concatenate [noisy_latents, fill_condition] along feature dim → [B, seq, 384]
+        if fill_condition_packed is not None:
+            packed_noisy_model_input = torch.cat(
+                [packed_noisy_model_input, fill_condition_packed], dim=2,
+            )
 
         latent_image_ids = DiT360Pipeline._prepare_latent_image_ids(
             bsz, packed_height, packed_width, self.device, dt
@@ -146,43 +227,9 @@ class DiT360Outpaint(L.LightningModule):
         else:
             guidance_vec = None
 
-        # Base FLUX weights load as float32; passing fp16 activations without autocast causes Half @ Float matmul errors.
-        # Match diffusers/Lightning: fp32 tensor inputs + autocast for the transformer forward when target dtype is fp16.
-        # use_cuda_amp = self.device.type == "cuda" and dt in (torch.float16, torch.bfloat16)
         target_dtype = torch.bfloat16 if "bf16" in str(self.hparams.args.precision) else torch.float16
         t_norm = timesteps / 1000
-        # if use_cuda_amp:
-        #     amp_ctx = torch.autocast(device_type="cuda", dtype=dt)
-        #     hs_in = packed_noisy_model_input.to(torch.float32)
-        #     t_in = t_norm.to(torch.float32)
-        #     img_in = latent_image_ids.to(torch.float32)
-        #     gv_in = guidance_vec.to(torch.float32) if guidance_vec is not None else None
-        #     pe_in = prompt_embeds.to(torch.float32)
-        #     ppe_in = pooled_prompt_embeds.to(torch.float32)
-        #     tid_in = text_ids.to(torch.float32)
-        # else:
-        #     amp_ctx = nullcontext()
-        #     hs_in = packed_noisy_model_input.to(dt)
-        #     t_in = t_norm.to(dt)
-        #     img_in = latent_image_ids
-        #     gv_in = guidance_vec
-        #     pe_in = prompt_embeds.to(dt)
-        #     ppe_in = pooled_prompt_embeds.to(dt)
-        #     tid_in = text_ids.to(dt)
 
-        # with amp_ctx:
-        #     model_pred = self.flux_transformer(
-        #         hidden_states=hs_in,
-        #         timestep=t_in,
-        #         guidance=gv_in,
-        #         pooled_projections=ppe_in,
-        #         encoder_hidden_states=pe_in,
-        #         txt_ids=tid_in,
-        #         img_ids=img_in,
-        #         return_dict=False,
-        #     )[0]
-
-        # 2. 强制将所有输入对其到目标精度 (BFloat16)，匹配 FLUX 的 Base Weights
         hs_in = packed_noisy_model_input.to(target_dtype)
         t_in = t_norm.to(target_dtype)
         img_in = latent_image_ids.to(target_dtype)
@@ -191,9 +238,6 @@ class DiT360Outpaint(L.LightningModule):
         ppe_in = pooled_prompt_embeds.to(target_dtype)
         tid_in = text_ids.to(target_dtype)
 
-        # 3. 【极其关键】必须加回局部的 autocast！
-        # 这样当 BFloat16 的输入遇到你 __init__ 里设置的 FP32 LoRA 权重时，
-        # autocast 才会介入，把 LoRA 权重也转为 BFloat16，完美完成前向传播。
         amp_ctx = torch.autocast(device_type="cuda", dtype=target_dtype) if self.device.type == "cuda" else nullcontext()
 
         with amp_ctx:
@@ -250,17 +294,27 @@ class DiT360Outpaint(L.LightningModule):
         dt = inference_dtype if inference_dtype is not None else self.dtype
         bsz = condition_pixels.shape[0]
         amp_ctx = torch.autocast(device_type="cuda", dtype=dt) if self.device.type == "cuda" else nullcontext()
-        condition_latents = encode_images(condition_pixels, self.vae).to(dt)
+
         um = unknown_masks.to(dt)
         if self._mask_dilate_px > 0:
             um = dilate_unknown_mask(um, radius_px=self._mask_dilate_px)
-        if valid_mask_blur_kernel_px >= 3:
+
+        # Fill mode: prepare condition with the hard (dilated-only) mask before any blur.
+        # _soften_unknown_mask_by_blurring_valid was designed for standard mode, where a soft mask
+        # smooths the noisy/clean latent compositing boundary. In Fill mode it would partially zero
+        # clean known pixels (masked_image = condition * (1 - soft_mask)), which misaligns with how
+        # FLUX Fill was trained (hard binary masks). Dilation is still applied above.
+        fill_condition_packed = None
+        if self._use_fill_model:
+            fill_condition_packed = self._prepare_fill_condition(
+                condition_pixels, um,
+            ).to(dt)
+
+        # Standard mode: optionally blur the mask for soft latent compositing boundary.
+        if not self._use_fill_model and valid_mask_blur_kernel_px >= 3:
             um = _soften_unknown_mask_by_blurring_valid(um, valid_mask_blur_kernel_px)
-        unknown_masks = F.interpolate(
-            um,
-            size=(condition_latents.shape[2], condition_latents.shape[3]),
-            mode="nearest",
-        )
+
+        condition_latents = encode_images(condition_pixels, self.vae).to(dt)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         latents = torch.randn(
@@ -269,7 +323,13 @@ class DiT360Outpaint(L.LightningModule):
             dtype=dt,
             generator=generator,
         )
-        latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
+        if not self._use_fill_model:
+            unknown_masks_latent = F.interpolate(
+                um,
+                size=(condition_latents.shape[2], condition_latents.shape[3]),
+                mode="nearest",
+            )
+            latents = unknown_masks_latent * latents + (1.0 - unknown_masks_latent) * condition_latents
 
         scheduler = copy.deepcopy(self.noise_scheduler)
         _, _, h_lat, w_lat = condition_latents.shape
@@ -301,7 +361,12 @@ class DiT360Outpaint(L.LightningModule):
         with amp_ctx:
             for t in timesteps:
                 timestep = t.expand(bsz).to(dt)
-                noisy_model_input = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
+                if self._use_fill_model:
+                    # Fill mode: pass full noisy latents; condition via concatenated channels.
+                    noisy_model_input = latents
+                else:
+                    # Standard mode: re-composite known region at each step.
+                    noisy_model_input = unknown_masks_latent * latents + (1.0 - unknown_masks_latent) * condition_latents  # noqa: F821
                 model_pred = self._forward_flux(
                     noisy_model_input=noisy_model_input,
                     timesteps=timestep,
@@ -310,9 +375,11 @@ class DiT360Outpaint(L.LightningModule):
                     text_ids=text_ids,
                     forward_dtype=dt,
                     guidance_scale_override=guidance_scale_override,
+                    fill_condition_packed=fill_condition_packed,
                 )
                 latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
-                latents = unknown_masks * latents + (1.0 - unknown_masks) * condition_latents
+                if not self._use_fill_model:
+                    latents = unknown_masks_latent * latents + (1.0 - unknown_masks_latent) * condition_latents  # noqa: F821
 
         return self._decode_latents(latents)
 
@@ -338,11 +405,24 @@ class DiT360Outpaint(L.LightningModule):
             unknown_masks = torch.stack(unknown_list, dim=0).to(device=self.device, dtype=self.dtype)
 
         target_latents = encode_images(target_pixels, self.vae).to(self.dtype)
-        condition_latents = encode_images(condition_pixels, self.vae).to(self.dtype)
+
+        # Prepare mask (pixel-space dilation, then latent-space resize)
         um = unknown_masks
         if self._mask_dilate_px > 0:
             um = dilate_unknown_mask(um, radius_px=self._mask_dilate_px)
-        unknown_masks = F.interpolate(
+
+        # For Fill mode: prepare condition through FLUX Fill concatenation path
+        fill_condition_packed = None
+        if self._use_fill_model:
+            fill_condition_packed = self._prepare_fill_condition(
+                condition_pixels, um,
+            ).to(self.dtype)
+
+        # Standard mode still needs condition_latents and latent-space unknown mask
+        if not self._use_fill_model:
+            condition_latents = encode_images(condition_pixels, self.vae).to(self.dtype)
+
+        unknown_masks_latent = F.interpolate(
             um,
             size=(target_latents.shape[2], target_latents.shape[3]),
             mode="nearest",
@@ -371,8 +451,12 @@ class DiT360Outpaint(L.LightningModule):
         )
         noisy_target = (1.0 - sigmas) * target_latents + sigmas * noise
 
-        # Keep known pixels from condition latents, only denoise unknown region.
-        noisy_model_input = unknown_masks * noisy_target + (1.0 - unknown_masks) * condition_latents
+        if self._use_fill_model:
+            # Fill mode: full noisy target as input; condition through concatenated channels.
+            noisy_model_input = noisy_target
+        else:
+            # Standard mode: keep known pixels from condition latents, only denoise unknown region.
+            noisy_model_input = unknown_masks_latent * noisy_target + (1.0 - unknown_masks_latent) * condition_latents
 
         model_pred = self._forward_flux(
             noisy_model_input=noisy_model_input,
@@ -380,14 +464,15 @@ class DiT360Outpaint(L.LightningModule):
             prompt_embeds=batch["prompt_embeds"],
             pooled_prompt_embeds=batch["pooled_prompt_embeds"],
             text_ids=batch["text_ids"],
+            fill_condition_packed=fill_condition_packed,
         )
 
         weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas)
         target = noise - target_latents
 
         per_pixel_loss = weighting.float() * (model_pred.float() - target.float()) ** 2
-        masked_loss = per_pixel_loss * unknown_masks.float()
-        denom = unknown_masks.float().sum().clamp(min=1.0)
+        masked_loss = per_pixel_loss * unknown_masks_latent.float()
+        denom = unknown_masks_latent.float().sum().clamp(min=1.0)
         loss = masked_loss.sum() / (denom * target.shape[1])
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)

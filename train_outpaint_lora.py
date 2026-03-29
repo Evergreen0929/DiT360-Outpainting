@@ -133,7 +133,7 @@ class PeriodicOutpaintEvalCallback(Callback):
         rows = []
         for i, idx in enumerate(self.eval_indices):
             sample = self.eval_dataset[idx]
-            condition, _generated_raw, generated, target_cpu = run_one_outpaint_eval(
+            condition, generated_raw, _generated_composited, target_cpu = run_one_outpaint_eval(
                 pl_module,
                 sample,
                 self.text_encoding_pipeline,
@@ -152,7 +152,7 @@ class PeriodicOutpaintEvalCallback(Callback):
             tgt_name = f"{i:03d}_{sid}_target.png"
 
             Image.fromarray(_norm_to_uint8_img(condition.cpu())).save(os.path.join(step_dir, in_name))
-            Image.fromarray(_norm_to_uint8_img(generated.cpu())).save(os.path.join(step_dir, gen_name))
+            Image.fromarray(_norm_to_uint8_img(generated_raw.cpu())).save(os.path.join(step_dir, gen_name))
             Image.fromarray(_norm_to_uint8_img(target_cpu)).save(os.path.join(step_dir, tgt_name))
 
             rows.append(
@@ -186,6 +186,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    parser.add_argument(
+        "--use_fill_model",
+        action="store_true",
+        help="Use FLUX Fill (inpaint) model with 384-channel concat input (noisy_latent + masked_image_latent + mask). "
+        "Base model should be black-forest-labs/FLUX.1-Fill-dev.",
+    )
     parser.add_argument("--init_lora_weights", type=str, default="Insta360-Research/DiT360-Panorama-Image-Generation")
     parser.add_argument("--train_id_list", type=str, required=True, help="Path to json list with pano ids.")
     parser.add_argument("--caption_map_file", type=str, default=None, help="Optional JSON map: pano_id -> caption.")
