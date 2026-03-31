@@ -211,6 +211,7 @@ class RandomPerspOutpaintDataset(Dataset):
         self.horizontal_view_prob = horizontal_view_prob
 
         self._s3_client = None
+        self._s3_client_pid = -1
         self._caption_map = self._load_caption_map(caption_map_file)
         self.ids = self._load_ids(id_list_file)
         self.subsets = [self._infer_subset_name(x) for x in self.ids]
@@ -307,21 +308,31 @@ class RandomPerspOutpaintDataset(Dataset):
     def __len__(self) -> int:
         return len(self.ids)
 
+    def _get_s3_client(self):
+        """Per-worker lazy S3 client. Keyed by PID so forked dataloader workers
+        each get their own client with fresh credentials."""
+        pid = os.getpid()
+        if self._s3_client is None or self._s3_client_pid != pid:
+            import boto3
+            from botocore.config import Config as BotoConfig
+
+            self._s3_client = boto3.client(
+                "s3",
+                config=BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"}),
+            )
+            self._s3_client_pid = pid
+        return self._s3_client
+
     def _open_image(self, uri: str) -> Image.Image:
         if uri.startswith("s3://"):
             try:
-                import boto3
-                from botocore.config import Config as BotoConfig
+                import boto3  # noqa: F401
             except ImportError as exc:
                 raise ImportError("boto3 is required for s3 training data access") from exc
 
-            if self._s3_client is None:
-                self._s3_client = boto3.client(
-                    "s3",
-                    config=BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"}),
-                )
+            client = self._get_s3_client()
             bucket, key = _parse_s3_uri(uri)
-            obj = self._s3_client.get_object(Bucket=bucket, Key=key)
+            obj = client.get_object(Bucket=bucket, Key=key)
             binary = obj["Body"].read()
             return Image.open(io.BytesIO(binary)).convert("RGB")
 
