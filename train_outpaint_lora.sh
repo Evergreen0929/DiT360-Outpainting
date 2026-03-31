@@ -25,7 +25,7 @@ export TEST_IDS="/mnt/localssd/code/DiT360/data/panomtdu_test.json"
 # Blur valid mask in pixel space before latent sampling (sample_outpaint only); even sizes use k+1.
 # export EVAL_VALID_MASK_BLUR_KERNEL_PX=32
 # Optional subset mix ratio example:
-export SUBSET_RATIOS="Sun360:2,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1"
+export SUBSET_RATIOS="Sun360:4,ZInD:1,scene:2,Matterport3D:4,Hunyuan:0.05,DiT360:0.1"
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 export CUDA_DEVICE=8
@@ -37,21 +37,23 @@ python train_outpaint_lora.py \
   --test_id_list="$TEST_IDS" \
   --pano_root="$PANO_ROOT" \
   --image_ext="jpg" \
-  --exclude_prefixes "DiT360_" \
+  \
   --seed=0 \
   --pano_width=1024 \
   --pano_height=512 \
   --perspective_size=512 \
   --min_views=1 \
-  --max_views=10 \
+  --max_views=5 \
   --min_fov=75 \
   --max_fov=105 \
-  --min_pitch=-75 \
-  --max_pitch=75 \
+  --min_pitch=-60 \
+  --max_pitch=60 \
+  --horizontal_pitch_max=20 \
+  --horizontal_view_prob=0.8 \
   --train_batch_size=1 \
   --adam_weight_decay=1e-2 \
   --dataloader_num_workers=16 \
-  --subset_sampling_ratios="${SUBSET_RATIOS:-Sun360:4,ZInD:1,scene:2,Matterport3D:4,Hunyuan:1}" \
+  --subset_sampling_ratios="${SUBSET_RATIOS:-Sun360:4,ZInD:1,scene:2,Matterport3D:4,Hunyuan:0.1,DiT360:0.1}" \
   --save_dir="$SAVE_DIR" \
   --devices="$CUDA_DEVICE" \
   --max_steps="${MAX_STEPS:-10000}" \

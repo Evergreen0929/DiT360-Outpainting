@@ -29,17 +29,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torchvision.transforms as T
 from peft import LoraConfig
 from PIL import Image
 
 from src.dit360_outpaint import DiT360Outpaint
 from src.outpaint_dataset import RandomPerspOutpaintDataset, build_condition_from_target
-from src.outpaint_eval_utils import resolve_smoke_inference_dtype, run_one_outpaint_eval
+from src.outpaint_eval_utils import (
+    OUTPAINT_EVAL_GUIDANCE_SCALE,
+    composite_generated_with_condition,
+    resolve_smoke_inference_dtype,
+    run_one_outpaint_eval,
+)
 from src.pipeline import DiT360Pipeline
 
 
 def _norm_to_uint8_img(tensor: torch.Tensor):
-    x = tensor.detach().cpu().clamp(-1.0, 1.0)
+    x = tensor.detach().cpu().float().clamp(-1.0, 1.0)
     x = (x * 0.5 + 0.5).clamp(0.0, 1.0)
     return (x.permute(1, 2, 0).numpy() * 255.0).astype("uint8")
 
@@ -204,6 +210,7 @@ def _model_args_from_cli(a: argparse.Namespace) -> Namespace:
         guidance_scale=a.guidance_scale,
         perspective_size=a.perspective_size,
         outpaint_mask_dilate_px=a.outpaint_mask_dilate_px,
+        use_fill_model=a.use_fill_model,
         precision=a.precision,
         weighting_scheme="none",
         logit_mean=0.0,
@@ -224,8 +231,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Smoke test outpaint eval without training; align with train eval.")
     p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     p.add_argument("--init_lora_weights", type=str, default="Insta360-Research/DiT360-Panorama-Image-Generation")
-    p.add_argument("--test_id_list", type=str, required=True)
-    p.add_argument("--pano_root", type=str, required=True)
+    p.add_argument("--test_id_list", type=str, default=None,
+                   help="Required for dataset eval mode; omit when using --input_image.")
+    p.add_argument("--pano_root", type=str, default=None,
+                   help="Required for dataset eval mode; omit when using --input_image.")
     p.add_argument("--caption_map_file", type=str, default=None)
     p.add_argument("--caption_template", type=str, default="This is a panorama image.")
     p.add_argument("--image_ext", type=str, default="jpg")
@@ -252,6 +261,11 @@ def parse_args():
         type=str,
         default="bf16-mixed",
         help="Lightning --precision from training; used for pl_module hparams and inference_dtype when auto.",
+    )
+    p.add_argument(
+        "--use_fill_model",
+        action="store_true",
+        help="Set when using FLUX.1-Fill-dev (384-channel concat input). Must match the training flag.",
     )
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=64)
@@ -329,7 +343,170 @@ def parse_args():
         action="store_true",
         help="Save *_unknown_inpaint.png: white=inpaint (unknown=1), black=keep — same mask as sample_outpaint uses before dilate.",
     )
+
+    # ---- single-image direct inference ----
+    g = p.add_argument_group(
+        "single-image inference",
+        "When --input_image is set, skip the dataset and run inference on one prepared panorama. "
+        "The image should already have known regions pasted in; unknown regions should be filled "
+        "with mid-gray (RGB 128,128,128) or covered by --mask_image.",
+    )
+    g.add_argument(
+        "--input_image",
+        type=str,
+        default=None,
+        help="Path to a prepared condition panorama (PNG/JPG). "
+        "Unknown pixels should be mid-gray (128,128,128) unless --mask_image is provided.",
+    )
+    g.add_argument(
+        "--mask_image",
+        type=str,
+        default=None,
+        help="Optional path to a grayscale mask (PNG/JPG, same resolution as --input_image). "
+        "White (>127) = inpaint; black = keep. "
+        "If omitted, pixels within --mid_gray_threshold of 0.5 are treated as unknown.",
+    )
+    g.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt for single-image inference (defaults to --caption_template).",
+    )
+    g.add_argument(
+        "--mid_gray_threshold",
+        type=float,
+        default=0.05,
+        help="Max per-channel deviation from 0.5 to be classified as 'unknown' when no --mask_image is given.",
+    )
+
     return p.parse_args()
+
+
+def _run_single_image_inference(a, model, text_pipe, inference_dtype, device):
+    """
+    Direct inference on a single pre-prepared condition panorama.
+
+    The caller has already loaded model weights and set up text_pipe.
+    """
+    # --- load condition image ---
+    # Keep condition & unknown in float32 (same as run_one_outpaint_eval where
+    # build_condition_from_target returns float32).  Only cast to inference_dtype
+    # when passing to sample_outpaint — this creates an independent copy so the
+    # original float32 tensors used for composite are never touched.
+    cond_img = Image.open(a.input_image).convert("RGB")
+    cond_img = cond_img.resize((a.pano_width, a.pano_height), Image.BICUBIC)
+    cond_tensor = T.ToTensor()(cond_img)  # [3, H, W] in [0, 1]
+    condition = (cond_tensor * 2.0 - 1.0).to(device=device, dtype=torch.float32)  # -> [-1, 1], float32
+
+    # --- build unknown mask ---
+    if a.mask_image:
+        mask_img = Image.open(a.mask_image).convert("L")
+        mask_img = mask_img.resize((a.pano_width, a.pano_height), Image.NEAREST)
+        mask_tensor = T.ToTensor()(mask_img)  # [1, H, W] in [0, 1]
+        unknown = (mask_tensor > 0.5).float().to(device=device, dtype=torch.float32)
+        print(f"[smoke][single] Mask loaded from {a.mask_image}. Unknown fraction: {unknown.mean().item():.4f}")
+    else:
+        # pixels within mid_gray_threshold of 0.5 across all channels → unknown
+        cond_01 = cond_tensor.to(device=device, dtype=torch.float32)
+        max_dev = (cond_01 - 0.5).abs().max(dim=0, keepdim=True).values  # [1, H, W]
+        unknown = (max_dev < a.mid_gray_threshold).float()  # float32, already on device
+        print(
+            f"[smoke][single] Auto-detected unknown mask (mid_gray_threshold={a.mid_gray_threshold}). "
+            f"Unknown fraction: {unknown.mean().item():.4f}"
+        )
+
+    # --- encode prompt ---
+    prompt_text = a.prompt if a.prompt else a.caption_template
+    prompt_embeds, pooled_prompt_embeds, text_ids = text_pipe.encode_prompt([prompt_text], prompt_2=None)
+    prompt_embeds = prompt_embeds.to(device=device, dtype=inference_dtype)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=inference_dtype)
+    text_ids = text_ids.to(device=device, dtype=inference_dtype)
+
+    # --- inference ---
+    # .to(dtype=inference_dtype) creates independent copies — matches run_one_outpaint_eval
+    # which also casts float32 condition/unknown to inference_dtype only for sample_outpaint.
+    with torch.no_grad():
+        generated_raw = model.sample_outpaint(
+            condition_pixels=condition.unsqueeze(0).to(dtype=inference_dtype),
+            unknown_masks=unknown.unsqueeze(0).to(dtype=inference_dtype),
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            text_ids=text_ids,
+            num_inference_steps=a.num_inference_steps,
+            seed=a.eval_seed,
+            inference_dtype=inference_dtype,
+            guidance_scale_override=OUTPAINT_EVAL_GUIDANCE_SCALE,
+            valid_mask_blur_kernel_px=a.eval_valid_mask_blur_kernel_px,
+        )[0]
+
+        # Hard composite with float32 condition (not the bfloat16 copy sample_outpaint saw).
+        # Matches run_one_outpaint_eval which composites with original float32 tensors.
+        generated = composite_generated_with_condition(
+            generated_raw,
+            condition,
+            unknown,
+            feather_sigma=0.0,
+            feather_kernel=None,
+        )
+
+    # --- diagnostic: verify known-region preservation ---
+    import numpy as np
+    cond_u8 = _norm_to_uint8_img(condition.cpu())
+    gen_u8 = _norm_to_uint8_img(generated.cpu())
+    known_2d = (unknown.squeeze(0).cpu().numpy() < 0.5)  # [H, W], True = known
+    if known_2d.any():
+        diff = np.abs(cond_u8.astype(np.int16) - gen_u8.astype(np.int16))
+        known_diff = diff[known_2d]
+        n_bad = int(np.count_nonzero(known_diff))
+        print(
+            f"[smoke][single][diag] Known-region pixel diff: "
+            f"max={known_diff.max()}, mean={known_diff.mean():.4f}, "
+            f"nonzero_values={n_bad}/{known_diff.size} "
+            f"({'BUG - known pixels changed!' if n_bad > 0 else 'OK - known pixels preserved'})"
+        )
+        if n_bad > 0:
+            # Save diff heatmap for visual debugging
+            diff_vis = np.zeros_like(cond_u8)
+            diff_vis[..., 0] = np.clip(diff.max(axis=-1) * 10, 0, 255).astype(np.uint8)  # red = diff
+
+    # --- save outputs ---
+    stem = Path(a.input_image).stem
+    out = a.output_dir
+    in_path = os.path.join(out, f"{stem}_condition.png")
+    raw_path = os.path.join(out, f"{stem}_generated_raw.png")
+    gen_path = os.path.join(out, f"{stem}_generated.png")
+    mask_out_path = os.path.join(out, f"{stem}_unknown_mask.png")
+
+    Image.fromarray(cond_u8).save(in_path)
+    Image.fromarray(_norm_to_uint8_img(generated_raw.cpu())).save(raw_path)
+    Image.fromarray(gen_u8).save(gen_path)
+    u8_mask = (unknown.float().clamp(0, 1) * 255).byte().cpu().squeeze(0).numpy()
+    Image.fromarray(u8_mask, mode="L").save(mask_out_path)
+
+    # --- save small HTML report ---
+    html_path = os.path.join(out, f"{stem}_result.html")
+    in_rel = os.path.basename(in_path)
+    raw_rel = os.path.basename(raw_path)
+    gen_rel = os.path.basename(gen_path)
+    mask_rel = os.path.basename(mask_out_path)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(
+            "<html><head><meta charset='utf-8'><title>Outpaint single result</title>"
+            "<style>body{font-family:Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;}"
+            "th,td{border:1px solid #ccc;padding:8px;vertical-align:top;} img{max-width:100%;height:auto;}</style>"
+            "</head><body>"
+            f"<h2>Single-image outpaint result: {stem}</h2>"
+            f"<p><b>Prompt:</b> {prompt_text}</p>"
+            "<table><tr><th>Condition</th><th>Unknown mask</th><th>Raw decode</th><th>Composited</th></tr>"
+            f"<tr><td><img src='{in_rel}'></td>"
+            f"<td><img src='{mask_rel}'></td>"
+            f"<td><img src='{raw_rel}'></td>"
+            f"<td><img src='{gen_rel}'></td></tr>"
+            "</table></body></html>"
+        )
+
+    print(f"[smoke][single] Done. Results saved to {out}/")
+    print(f"[smoke][single] Open: {html_path}")
 
 
 def main():
@@ -389,24 +566,6 @@ def main():
 
     text_pipe = DiT360Pipeline.from_pretrained(a.pretrained_model_name_or_path, vae=None, transformer=None)
 
-    ds = RandomPerspOutpaintDataset(
-        id_list_file=a.test_id_list,
-        pano_root=a.pano_root,
-        pano_height=a.pano_height,
-        pano_width=a.pano_width,
-        image_ext=a.image_ext,
-        caption_map_file=a.caption_map_file,
-        caption_template=a.caption_template,
-        exclude_prefixes=a.exclude_prefixes,
-        min_views=a.min_views,
-        max_views=a.max_views,
-        min_fov=a.min_fov,
-        max_fov=a.max_fov,
-        min_pitch=a.min_pitch,
-        max_pitch=a.max_pitch,
-        perspective_size=a.perspective_size,
-    )
-
     inference_dtype = resolve_smoke_inference_dtype(
         device, a.inference_dtype, lightning_precision=a.precision if a.inference_dtype == "auto" else None
     )
@@ -452,6 +611,35 @@ def main():
                 )
 
     os.makedirs(a.output_dir, exist_ok=True)
+
+    # ---- single-image direct inference ----
+    if a.input_image:
+        _run_single_image_inference(a, model, text_pipe, inference_dtype, device)
+        return
+
+    # ---- dataset eval mode ----
+    if not a.test_id_list or not a.pano_root:
+        print("[smoke] --test_id_list and --pano_root are required for dataset eval mode.", file=sys.stderr)
+        sys.exit(1)
+
+    ds = RandomPerspOutpaintDataset(
+        id_list_file=a.test_id_list,
+        pano_root=a.pano_root,
+        pano_height=a.pano_height,
+        pano_width=a.pano_width,
+        image_ext=a.image_ext,
+        caption_map_file=a.caption_map_file,
+        caption_template=a.caption_template,
+        exclude_prefixes=a.exclude_prefixes,
+        min_views=a.min_views,
+        max_views=a.max_views,
+        min_fov=a.min_fov,
+        max_fov=a.max_fov,
+        min_pitch=a.min_pitch,
+        max_pitch=a.max_pitch,
+        perspective_size=a.perspective_size,
+    )
+
     total = len(ds)
     k = min(a.num_samples, total)
     subset_rng = random.Random(a.eval_seed)

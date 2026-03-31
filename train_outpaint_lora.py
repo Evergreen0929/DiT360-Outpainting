@@ -111,6 +111,8 @@ class PeriodicOutpaintEvalCallback(Callback):
             min_pitch=args.min_pitch,
             max_pitch=args.max_pitch,
             perspective_size=args.perspective_size,
+            horizontal_pitch_max=args.horizontal_pitch_max,
+            horizontal_view_prob=args.horizontal_view_prob,
         )
 
         total = len(self.eval_dataset)
@@ -202,8 +204,8 @@ def parse_args():
         "--exclude_prefixes",
         type=str,
         nargs="+",
-        default=["DiT360_"],
-        help="Any sample id starting with one of these prefixes will be ignored.",
+        default=[],
+        help="Any sample id starting with one of these prefixes will be ignored. Empty by default.",
     )
 
     parser.add_argument("--pano_height", type=int, default=512)
@@ -217,11 +219,24 @@ def parse_args():
         "Eval RGB composite still uses the undilated mask.",
     )
     parser.add_argument("--min_views", type=int, default=1)
-    parser.add_argument("--max_views", type=int, default=10)
+    parser.add_argument("--max_views", type=int, default=3)
     parser.add_argument("--min_fov", type=float, default=75.0)
     parser.add_argument("--max_fov", type=float, default=105.0)
-    parser.add_argument("--min_pitch", type=float, default=-30.0)
-    parser.add_argument("--max_pitch", type=float, default=30.0)
+    parser.add_argument("--min_pitch", type=float, default=-60.0)
+    parser.add_argument("--max_pitch", type=float, default=60.0)
+    parser.add_argument(
+        "--horizontal_pitch_max",
+        type=float,
+        default=20.0,
+        help="Max |pitch| (degrees) for the horizontal-band views. 80%% of views are sampled from this range.",
+    )
+    parser.add_argument(
+        "--horizontal_view_prob",
+        type=float,
+        default=0.8,
+        help="Probability that a view's pitch is drawn from the narrow horizontal band; "
+        "remaining views are drawn from the full [min_pitch, max_pitch] range.",
+    )
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
@@ -320,6 +335,8 @@ def main():
         min_pitch=args.min_pitch,
         max_pitch=args.max_pitch,
         perspective_size=args.perspective_size,
+        horizontal_pitch_max=args.horizontal_pitch_max,
+        horizontal_view_prob=args.horizontal_view_prob,
     )
 
     sampler = None

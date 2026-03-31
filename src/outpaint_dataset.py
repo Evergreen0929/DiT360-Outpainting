@@ -184,12 +184,14 @@ class RandomPerspOutpaintDataset(Dataset):
         caption_template: str = "This is a panorama image.",
         exclude_prefixes: Optional[List[str]] = None,
         min_views: int = 1,
-        max_views: int = 10,
+        max_views: int = 3,
         min_fov: float = 75.0,
         max_fov: float = 105.0,
-        min_pitch: float = -30.0,
-        max_pitch: float = 30.0,
+        min_pitch: float = -60.0,
+        max_pitch: float = 60.0,
         perspective_size: int = 512,
+        horizontal_pitch_max: float = 20.0,
+        horizontal_view_prob: float = 0.8,
     ) -> None:
         self.id_list_file = id_list_file
         self.pano_root = pano_root.rstrip("/")
@@ -197,7 +199,7 @@ class RandomPerspOutpaintDataset(Dataset):
         self.pano_width = pano_width
         self.image_ext = image_ext.lstrip(".")
         self.caption_template = caption_template
-        self.exclude_prefixes = exclude_prefixes or ["DiT360_"]
+        self.exclude_prefixes = exclude_prefixes or []
         self.min_views = min_views
         self.max_views = max_views
         self.min_fov = min_fov
@@ -205,6 +207,8 @@ class RandomPerspOutpaintDataset(Dataset):
         self.min_pitch = min_pitch
         self.max_pitch = max_pitch
         self.perspective_size = perspective_size
+        self.horizontal_pitch_max = horizontal_pitch_max
+        self.horizontal_view_prob = horizontal_view_prob
 
         self._s3_client = None
         self._caption_map = self._load_caption_map(caption_map_file)
@@ -326,6 +330,20 @@ class RandomPerspOutpaintDataset(Dataset):
     def _build_uri(self, pano_id: str) -> str:
         return f"{self.pano_root}/{pano_id}.{self.image_ext}"
 
+    def _sample_pitch(self) -> float:
+        """Sample pitch with bias toward horizontal views.
+
+        With probability `horizontal_view_prob`, pitch is drawn from the narrow
+        horizontal band [-horizontal_pitch_max, +horizontal_pitch_max].
+        Otherwise it is drawn from the full range [min_pitch, max_pitch], which
+        allows up-tilt/down-tilt (sky/floor) views.
+        """
+        if random.random() < self.horizontal_view_prob:
+            lo = max(self.min_pitch, -self.horizontal_pitch_max)
+            hi = min(self.max_pitch, self.horizontal_pitch_max)
+            return random.uniform(lo, hi)
+        return random.uniform(self.min_pitch, self.max_pitch)
+
     def _sample_view_params(self) -> Tuple[torch.Tensor, int]:
         candidates = list(range(self.min_views, self.max_views + 1))
         weights = [self.max_views + 1 - k for k in candidates]
@@ -333,7 +351,7 @@ class RandomPerspOutpaintDataset(Dataset):
         params = torch.zeros((self.max_views, 3), dtype=torch.float32)
         for i in range(n_views):
             yaw = random.uniform(-180.0, 180.0)
-            pitch = random.uniform(self.min_pitch, self.max_pitch)
+            pitch = self._sample_pitch()
             fov = random.uniform(self.min_fov, self.max_fov)
             params[i, 0] = yaw
             params[i, 1] = pitch
